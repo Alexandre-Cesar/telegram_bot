@@ -8,7 +8,6 @@ from telegram.ext import (
 
 from . import config, flow, state
 
-MIMES_OK = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 ERRO = "Deu um erro aqui. Envie a foto novamente ou use /cancelar."
 
 
@@ -34,25 +33,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _enviar(update.message, flow.cancelar(update.effective_user.id))
+    try:
+        replies = await asyncio.to_thread(flow.cancelar, update.effective_user.id)
+        await _enviar(update.message, replies)
+    except Exception as e:  # noqa: BLE001
+        print("erro ao cancelar:", repr(e))
+        await update.message.reply_text(ERRO)
 
 
 async def on_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
     try:
-        if msg.photo:  # foto comum: o Telegram comprime; pegamos a maior resolução
-            tg_file, mime = await msg.photo[-1].get_file(), "image/jpeg"
-        else:  # enviada como arquivo: qualidade original
-            tg_file, mime = await msg.document.get_file(), msg.document.mime_type or "image/jpeg"
-
-        if mime not in MIMES_OK:
-            return await msg.reply_text("Formato não suportado. Envie JPG, PNG ou WEBP.")
+        # foto comum: o Telegram comprime (pegamos a maior resolução); arquivo: qualidade original
+        tg_file = await (msg.photo[-1] if msg.photo else msg.document).get_file()
+        if tg_file.file_size and tg_file.file_size > config.MAX_FOTO_MB * 1024 * 1024:
+            return await msg.reply_text(f"Arquivo muito grande (máximo {config.MAX_FOTO_MB} MB).")
 
         await msg.reply_text("Foto recebida, lendo a localização...")
         conteudo = bytes(await tg_file.download_as_bytearray())
-        # funções do fluxo fazem I/O bloqueante (Anthropic, Drive): rodam em thread
-        replies = await asyncio.to_thread(flow.receber_foto, user.id, user.full_name, conteudo, mime)
+        # as funções do fluxo fazem I/O bloqueante (Gemini, Drive): rodam em thread
+        replies = await asyncio.to_thread(flow.receber_foto, user.id, user.full_name, conteudo)
         await _enviar(msg, replies)
     except Exception as e:  # noqa: BLE001
         print("erro ao receber foto:", repr(e))
@@ -69,6 +70,10 @@ async def on_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(ERRO)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print("erro não tratado:", repr(context.error))
+
+
 def main():
     state.init()
     permitido = filters.User(user_id=list(config.ALLOWED_USER_IDS)) if config.ALLOWED_USER_IDS else filters.ALL
@@ -79,7 +84,12 @@ def main():
     app.add_handler(CommandHandler("cancelar", cmd_cancelar, filters=permitido))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & permitido, on_foto))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & permitido, on_texto))
+    app.add_error_handler(on_error)
 
+    if not config.ALLOWED_USER_IDS:
+        print("AVISO: ALLOWED_USER_IDS vazio, qualquer pessoa pode usar este bot.")
+    destino = f"pasta '{config.DADOS_DIR}'" if config.ARMAZENAMENTO == "local" else "Drive e Google Sheets"
+    print(f"Armazenamento: {config.ARMAZENAMENTO} ({destino})")
     print("Bot rodando (Ctrl+C para parar)...")
     app.run_polling()
 
